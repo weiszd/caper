@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# caper-expose — control which host paths the caper-server container can see.
+#
+# The container bind-mounts $STAGE/{gpfs0,gpfs0-old,mnt} -> /{gpfs0,gpfs0-old,mnt}
+# with rslave propagation. Binding a host path under $STAGE (same relative path)
+# makes it appear live in the container at its original path; unmounting revokes it.
+#
+# Must run as root. Installed copy lives in /usr/local/sbin, config in /etc —
+# never on /gpfs0/work/caper (container-writable).
+#
+#   caper-expose apply            mount every entry in $CONF (idempotent)
+#   caper-expose add PATH ro|rw   mount PATH and record it in $CONF
+#   caper-expose rm PATH          unmount PATH and drop it from $CONF
+#   caper-expose reload           unmount everything, then apply (fixes stale NFS)
+#   caper-expose list             show config and live mount state
+set -euo pipefail
+
+STAGE=${CAPER_EXPOSE_STAGE:-/srv/caper-view}
+CONF=${CAPER_EXPOSE_CONF:-/etc/caper-expose.conf}
+
+die() { echo "caper-expose: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "must run as root"
+
+# Staging root as its own shared mount, so its submounts form a separate peer group.
+init_stage() {
+    mkdir -p "$STAGE"
+    if ! mountpoint -q "$STAGE"; then
+        mount --bind "$STAGE" "$STAGE"
+        mount --make-private "$STAGE"
+        mount --make-shared "$STAGE"
+    fi
+}
+
+# Entries as "mode path", parents first.
+entries() { grep -Ev '^\s*(#|$)' "$CONF" | awk '{print $2, $1}' | LC_ALL=C sort | awk '{print $2, $1}'; }
+
+do_mount() {
+    local mode=$1 src=$2 dst=$STAGE$2
+    [[ $mode == ro || $mode == rw ]] || die "bad mode '$mode' for $src"
+    [[ -d $src ]] || die "$src: not a directory"
+    if mountpoint -q "$dst"; then
+        echo "ok     $mode $src"
+        return
+    fi
+    # Staging dirs are created root-owned 755: if a mount is missing, the container
+    # user gets EACCES instead of silently writing to local disk.
+    mkdir -p "$dst" || die "cannot create $dst (parent is an ro bind? path must already exist in source)"
+    mount --bind -o "$mode,nosuid,nodev" "$src" "$dst" || die "mount failed: $src"
+    echo "mount  $mode $src"
+}
+
+do_umount() {
+    local dst=$STAGE$1
+    mountpoint -q "$dst" || { echo "absent    $1"; return; }
+    if findmnt -rn -o TARGET | grep -q "^$dst/"; then
+        die "$1 has exposed children; rm them first"
+    fi
+    umount "$dst"
+    # Remove now-empty dirs, but only ones on the staging fs itself — never real dirs
+    # sitting under another exposed bind.
+    local d=$dst
+    while [[ $d != "$STAGE" && $(findmnt -n -o TARGET -T "$d") == "$STAGE" ]]; do
+        rmdir "$d" 2>/dev/null || break
+        d=$(dirname "$d")
+    done
+    echo "umount    $1"
+}
+
+cmd=${1:-}; shift || true
+touch "$CONF"
+case $cmd in
+    apply)
+        init_stage
+        # Keep going past failures (e.g. one NFS server down at boot); exit nonzero.
+        rc=0
+        while read -r mode path; do ( do_mount "$mode" "$path" ) || rc=1; done < <(entries)
+        exit $rc
+        ;;
+    add)
+        [[ $# -eq 2 ]] || die "usage: add PATH ro|rw"
+        path=$(realpath -e "$1") mode=$2
+        init_stage
+        do_mount "$mode" "$path"
+        grep -Eq "^\s*(ro|rw)\s+$path\s*$" "$CONF" || echo "$mode $path" >> "$CONF"
+        ;;
+    rm)
+        [[ $# -eq 1 ]] || die "usage: rm PATH"
+        path=${1%/}
+        do_umount "$path"
+        sed -i -E "\#^\s*(ro|rw)\s+$path\s*\$#d" "$CONF"
+        ;;
+    reload)
+        # Children first. Paths vanish from the container briefly.
+        while read -r mode path; do do_umount "$path"; done < <(entries | tac)
+        "$0" apply
+        ;;
+    list)
+        echo "# $CONF"; entries
+        echo "# live under $STAGE"
+        findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | awk -v s="$STAGE/" 'index($1, s) == 1' |
+            sed "s#^$STAGE##" | awk '{split($4,o,","); print o[1], $1, $3}'
+        ;;
+    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

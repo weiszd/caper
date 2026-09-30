@@ -1,0 +1,157 @@
+###############################################################################
+# Caper SLURM — Caper server + PostgreSQL
+#
+# Runs a containerized Caper/Cromwell server that submits WDL tasks to your
+# SLURM cluster. SLURM client binaries and libraries are bind-mounted from
+# the host — no SLURM packages are installed inside the container.
+#
+# Usage:
+#   1. cp env.template .env && nano .env
+#   2. bash setup.sh
+#   3. docker compose build
+#   4. docker compose up -d
+#   5. docker compose exec caper caper list
+###############################################################################
+
+services:
+
+  # ── PostgreSQL metadata database ──────────────────────────────────────────
+  postgresql:
+    image: postgres:16-alpine
+    container_name: caper-postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRESQL_DB_USER:-cromwell}
+      POSTGRES_PASSWORD: ${POSTGRESQL_DB_PASSWORD:-cromwell}
+      POSTGRES_DB: ${POSTGRESQL_DB_NAME:-cromwell}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    # ports:
+    #   - "${POSTGRESQL_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRESQL_DB_USER:-cromwell} -d ${POSTGRESQL_DB_NAME:-cromwell}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Caper server ──────────────────────────────────────────────────────────
+  caper:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.slurm
+    container_name: caper-server
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    # Run as the host user so SLURM accepts job submissions
+    user: "${CAPER_UID:-31337}:${CAPER_GID:-1000}"
+    environment:
+      # Ensure mounted SLURM libs are found
+      LD_LIBRARY_PATH: /usr/lib64:/usr/lib64/slurm
+      HOME: /home/caper
+      # Shells/logs in cluster time (/etc/localtime below covers SSH sessions).
+      TZ: America/Chicago
+      # Cromwell writes JVM-local time into "timestamp without time zone" columns;
+      # existing rows are UTC, so the JVM must stay UTC (else heartbeats look 5h in the future).
+      JAVA_TOOL_OPTIONS: -Duser.timezone=UTC
+    volumes:
+      # ── User identity (so the host user exists in the container) ──
+      # Container-only passwd: caper + SSH aliases (same UID). Recreate container after edits.
+      - ./ssh/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      # ── Persistent writable home for SSH sessions (byobu, gh, git config) ──
+      - /gpfs0/work/caper/home:/home/caper
+      # ── Caper configuration ──
+      - ./caper.conf:/home/caper/.caper/default.conf:ro
+
+      # ── SLURM client binaries (from host) ──
+      - /usr/bin/sbatch:/usr/bin/sbatch:ro
+      - /usr/bin/squeue:/usr/bin/squeue:ro
+      - /usr/bin/scancel:/usr/bin/scancel:ro
+      - /usr/bin/sinfo:/usr/bin/sinfo:ro
+      - /usr/bin/scontrol:/usr/bin/scontrol:ro
+
+      # ── SLURM libraries (from host) ──
+      - /usr/lib64/slurm:/usr/lib64/slurm:ro
+      - /usr/lib64/libslurm.so:/usr/lib64/libslurm.so:ro
+      - /usr/lib64/libslurm.so.44:/usr/lib64/libslurm.so.44:ro
+      - /usr/lib64/libslurm.so.44.0.0:/usr/lib64/libslurm.so.44.0.0:ro
+
+      # ── Munge authentication (from host) ──
+      - /usr/lib64/libmunge.so:/usr/lib64/libmunge.so:ro
+      - /usr/lib64/libmunge.so.2:/usr/lib64/libmunge.so.2:ro
+      - /usr/lib64/libmunge.so.2.0.0:/usr/lib64/libmunge.so.2.0.0:ro
+      - /var/run/munge:/var/run/munge
+
+      # ── SLURM configuration (from host) ──
+      - /etc/slurm:/etc/slurm:ro
+
+      # ── Host resolution (SLURM controller hostnames) ──
+      - /etc/hosts:/etc/hosts:ro
+      - /etc/localtime:/etc/localtime:ro
+
+      # ── Shared filesystems (same paths as compute nodes) ──
+      # Controlled live from the host by caper-expose (see expose/): it bind-mounts
+      # each path in /etc/caper-expose.conf under /srv/caper-view with ro/rw, and
+      # rslave propagates those mounts in/out of the container without a restart.
+      # Server needs read access to inputs for xxh64 hashing + soft-link localization.
+      - type: bind
+        source: /srv/caper-view/gpfs0
+        target: /gpfs0
+        bind: {propagation: rslave}
+      - type: bind
+        source: /srv/caper-view/gpfs0-old
+        target: /gpfs0-old
+        bind: {propagation: rslave}
+      - type: bind
+        source: /srv/caper-view/mnt
+        target: /mnt
+        bind: {propagation: rslave}
+
+      # ── Cromwell logs (on shared filesystem, accessible without docker) ──
+      - /gpfs0/work/caper/logs:/opt/caper/logs
+
+      # ── SSH (non-root sshd on :2222, reached only via tailscale sidecar) ──
+      # Directory mount (not per-file) so edits to authorized_keys apply live
+      - ./ssh:/etc/caper-ssh:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    ports:
+      - "${CAPER_PORT:-8000}:8000"
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mkdir -p -m 700 /gpfs0/work/caper/sshd
+        [ -f /gpfs0/work/caper/sshd/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N '' -f /gpfs0/work/caper/sshd/ssh_host_ed25519_key
+        /usr/sbin/sshd -f /etc/caper-ssh/sshd_config -E /opt/caper/logs/sshd.log
+        caper server 2>&1 | tee /opt/caper/logs/cromwell.out
+
+  # ── Tailscale sidecar (userspace, SSH only) ───────────────────────────────
+  # Own network namespace; tailnet :22 → caper:2222 via serve config.
+  # Caper/Postgres networking is unchanged.
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: caper-tailscale
+    restart: unless-stopped
+    hostname: caper-ssh
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: caper-ssh
+      TS_USERSPACE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_EXTRA_ARGS: --advertise-tags=tag:caper
+    volumes:
+      - tsstate:/var/lib/tailscale
+      - ./ssh/ts-serve.json:/config/serve.json:ro
+    depends_on:
+      - caper
+
+volumes:
+  pgdata:
+    driver: local
+  tsstate:
+    driver: local

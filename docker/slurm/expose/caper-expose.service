@@ -1,0 +1,13 @@
+[Unit]
+Description=Expose host paths to caper-server container (/srv/caper-view)
+Wants=remote-fs.target
+After=remote-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/caper-expose apply
+
+[Install]
+WantedBy=multi-user.target
